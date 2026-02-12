@@ -6,7 +6,7 @@
 
 ---
 
-<p align="center"><sub>Inspired by <a href="https://openclaw.ai">OpenClaw</a>'s approach to agent memory.</sub></p>
+<p align="center"><a href="https://pradeep.md/2026/02/11/pi-mem.html">Blog post</a> · <sub>Inspired by <a href="https://openclaw.ai">OpenClaw</a>'s approach to agent memory.</sub></p>
 
 ## Layout
 
