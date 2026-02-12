@@ -4,7 +4,7 @@
   pi-mem
 </h1>
 
-Plain-Markdown memory system for [pi](https://github.com/mariozechner/pi-coding-agent). No embeddings, no vector search — just files on disk injected into context. Inspired by [OpenClaw](https://openclaw.ai)'s approach to agent memory.
+Plain-Markdown memory system for [pi](https://pi.dev/). No embeddings, no vector search — just files on disk injected into context. Inspired by [OpenClaw](https://openclaw.ai)'s approach to agent memory.
 
 ## Layout
 
