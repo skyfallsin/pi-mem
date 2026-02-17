@@ -33,14 +33,40 @@ import * as path from "node:path";
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 
-const MEMORY_DIR = path.join(process.env.HOME ?? "~", ".pi", "agent", "memory");
+const MEMORY_DIR = process.env.PI_MEMORY_DIR ?? path.join(process.env.HOME ?? "~", ".pi", "agent", "memory");
 const MEMORY_FILE = path.join(MEMORY_DIR, "MEMORY.md");
 const SCRATCHPAD_FILE = path.join(MEMORY_DIR, "SCRATCHPAD.md");
-const DAILY_DIR = path.join(MEMORY_DIR, "daily");
+const DAILY_DIR = process.env.PI_DAILY_DIR ?? path.join(MEMORY_DIR, "daily");
+const NOTES_DIR = path.join(MEMORY_DIR, "notes");
+
+// Extra files to inject into context alongside MEMORY.md/SCRATCHPAD.md/daily.
+// Comma-separated list of filenames resolved relative to MEMORY_DIR.
+// These should be small, always-needed identity/behavioral files.
+// Example: PI_CONTEXT_FILES=SOUL.md,AGENTS.md,HEARTBEAT.md
+const CONTEXT_FILES = (process.env.PI_CONTEXT_FILES ?? "")
+	.split(",")
+	.map(f => f.trim())
+	.filter(Boolean);
+
+// Auto-commit changes to git after every write. Off by default.
+const AUTOCOMMIT = process.env.PI_AUTOCOMMIT === "1" || process.env.PI_AUTOCOMMIT === "true";
+
+import { execFileSync } from "node:child_process";
+
+function gitCommit(message: string) {
+	if (!AUTOCOMMIT) return;
+	try {
+		execFileSync("git", ["add", "-A"], { cwd: MEMORY_DIR, stdio: "ignore", timeout: 5000 });
+		execFileSync("git", ["commit", "-m", message, "--allow-empty-message", "--no-verify"], { cwd: MEMORY_DIR, stdio: "ignore", timeout: 5000 });
+	} catch {
+		// git not available or not a repo — silently skip
+	}
+}
 
 function ensureDirs() {
 	fs.mkdirSync(MEMORY_DIR, { recursive: true });
 	fs.mkdirSync(DAILY_DIR, { recursive: true });
+	fs.mkdirSync(NOTES_DIR, { recursive: true });
 }
 
 function todayStr(): string {
@@ -119,6 +145,15 @@ function serializeScratchpad(items: ScratchpadItem[]): string {
 function buildMemoryContext(): string {
 	ensureDirs();
 	const sections: string[] = [];
+
+	// Configurable context files (SOUL.md, AGENTS.md, HEARTBEAT.md, etc.)
+	for (const fileName of CONTEXT_FILES) {
+		const filePath = path.join(MEMORY_DIR, fileName);
+		const content = readFileSafe(filePath);
+		if (content?.trim()) {
+			sections.push(`## ${fileName}\n\n${content.trim()}`);
+		}
+	}
 
 	const longTerm = readFileSafe(MEMORY_FILE);
 	if (longTerm?.trim()) {
@@ -524,20 +559,24 @@ export default function (pi: ExtensionAPI) {
 		name: "memory_write",
 		label: "Memory Write",
 		description: [
-			"Write to memory files. Two targets:",
+			"Write to memory files. Three targets:",
 			"- 'long_term': Write to MEMORY.md (curated durable facts, decisions, preferences). Mode: 'append' or 'overwrite'.",
 			"- 'daily': Append to today's daily log (daily/<YYYY-MM-DD>.md). Always appends.",
+			"- 'note': Create or update a file in notes/ (e.g. lessons.md, self-review.md). Pass filename. Mode: 'append' or 'overwrite'.",
 			"Use this when the user asks you to remember something, or when you learn important preferences/decisions.",
 		].join("\n"),
 		parameters: Type.Object({
-			target: StringEnum(["long_term", "daily"] as const, {
-				description: "Where to write: 'long_term' for MEMORY.md, 'daily' for today's daily log",
+			target: StringEnum(["long_term", "daily", "note"] as const, {
+				description: "Where to write: 'long_term' for MEMORY.md, 'daily' for today's daily log, 'note' for notes/<filename>",
 			}),
 			content: Type.String({ description: "Content to write (Markdown)" }),
 			mode: Type.Optional(
 				StringEnum(["append", "overwrite"] as const, {
-					description: "Write mode for long_term target. Default: 'append'. Daily always appends.",
+					description: "Write mode. Default: 'append'. Daily always appends.",
 				}),
+			),
+			filename: Type.Optional(
+				Type.String({ description: "Filename for 'note' target (e.g. 'lessons.md')" }),
 			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -545,6 +584,34 @@ export default function (pi: ExtensionAPI) {
 			const { target, content, mode } = params;
 			const sid = shortSessionId(ctx.sessionManager.getSessionId());
 			const ts = nowTimestamp();
+
+			if (target === "note") {
+				if (!filename) {
+					return { content: [{ type: "text", text: "Error: 'filename' is required for target 'note'." }], details: {} };
+				}
+				const safe = path.basename(filename);
+				const filePath = path.join(NOTES_DIR, safe);
+				const existing = readFileSafe(filePath) ?? "";
+
+				if (mode === "overwrite") {
+					const stamped = `<!-- last updated: ${ts} [${sid}] -->\n${content}`;
+					fs.writeFileSync(filePath, stamped, "utf-8");
+					gitCommit(`note: ${safe}`);
+					return {
+						content: [{ type: "text", text: `Wrote notes/${safe}` }],
+						details: { path: filePath, target, mode: "overwrite", sessionId: sid, timestamp: ts },
+					};
+				}
+
+				const separator = existing.trim() ? "\n\n" : "";
+				const stamped = `<!-- ${ts} [${sid}] -->\n${content}`;
+				fs.writeFileSync(filePath, existing + separator + stamped, "utf-8");
+				gitCommit(`note: ${safe}`);
+				return {
+					content: [{ type: "text", text: `Appended to notes/${safe}` }],
+					details: { path: filePath, target, mode: "append", sessionId: sid, timestamp: ts },
+				};
+			}
 
 			if (target === "daily") {
 				const filePath = dailyPath(todayStr());
@@ -557,6 +624,7 @@ export default function (pi: ExtensionAPI) {
 				const separator = existing.trim() ? "\n\n" : "";
 				const stamped = `<!-- ${ts} [${sid}] -->\n${content}`;
 				fs.writeFileSync(filePath, existing + separator + stamped, "utf-8");
+				gitCommit(`daily: ${todayStr()}`);
 				return {
 					content: [{ type: "text", text: `Appended to daily log: ${filePath}${existingSnippet}` }],
 					details: { path: filePath, target, mode: "append", sessionId: sid, timestamp: ts },
@@ -572,6 +640,7 @@ export default function (pi: ExtensionAPI) {
 			if (mode === "overwrite") {
 				const stamped = `<!-- last updated: ${ts} [${sid}] -->\n${content}`;
 				fs.writeFileSync(MEMORY_FILE, stamped, "utf-8");
+				gitCommit("memory: overwrite");
 				return {
 					content: [{ type: "text", text: `Overwrote MEMORY.md${existingSnippet}` }],
 					details: { path: MEMORY_FILE, target, mode: "overwrite", sessionId: sid, timestamp: ts },
@@ -582,6 +651,7 @@ export default function (pi: ExtensionAPI) {
 			const separator = existing.trim() ? "\n\n" : "";
 			const stamped = `<!-- ${ts} [${sid}] -->\n${content}`;
 			fs.writeFileSync(MEMORY_FILE, existing + separator + stamped, "utf-8");
+			gitCommit("memory: append");
 			return {
 				content: [{ type: "text", text: `Appended to MEMORY.md${existingSnippet}` }],
 				details: { path: MEMORY_FILE, target, mode: "append", sessionId: sid, timestamp: ts },
@@ -634,6 +704,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				items.push({ done: false, text, meta: `<!-- ${ts} [${sid}] -->` });
 				fs.writeFileSync(SCRATCHPAD_FILE, serializeScratchpad(items), "utf-8");
+				gitCommit(`scratchpad: add`);
 				return {
 					content: [{ type: "text", text: `Added: - [ ] ${text}\n\n${serializeScratchpad(items)}` }],
 					details: { action, sessionId: sid, timestamp: ts },
@@ -661,6 +732,7 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 				fs.writeFileSync(SCRATCHPAD_FILE, serializeScratchpad(items), "utf-8");
+				gitCommit(`scratchpad: ${action}`);
 				return {
 					content: [{ type: "text", text: `Updated.\n\n${serializeScratchpad(items)}` }],
 					details: { action, sessionId: sid, timestamp: ts },
@@ -672,6 +744,7 @@ export default function (pi: ExtensionAPI) {
 				items = items.filter((i) => !i.done);
 				const removed = before - items.length;
 				fs.writeFileSync(SCRATCHPAD_FILE, serializeScratchpad(items), "utf-8");
+				gitCommit("scratchpad: clear_done");
 				return {
 					content: [{ type: "text", text: `Cleared ${removed} done item(s).\n\n${serializeScratchpad(items)}` }],
 					details: { action, removed },
@@ -691,33 +764,69 @@ export default function (pi: ExtensionAPI) {
 			"- 'long_term': Read MEMORY.md",
 			"- 'scratchpad': Read SCRATCHPAD.md",
 			"- 'daily': Read a specific day's log (default: today). Pass date as YYYY-MM-DD.",
-			"- 'list': List all daily log files.",
+			"- 'file': Read any file by name (e.g. 'SOUL.md'). Pass filename.",
+			"- 'note': Read a file from notes/ (e.g. 'lessons.md'). Pass filename.",
+			"- 'list': List all files in the memory directory.",
 		].join("\n"),
 		parameters: Type.Object({
-			target: StringEnum(["long_term", "scratchpad", "daily", "list"] as const, {
+			target: StringEnum(["long_term", "scratchpad", "daily", "file", "note", "list"] as const, {
 				description: "What to read",
 			}),
 			date: Type.Optional(
 				Type.String({ description: "Date for daily log (YYYY-MM-DD). Default: today." }),
 			),
+			filename: Type.Optional(
+				Type.String({ description: "Filename for 'file' target (e.g. 'lessons.md', 'SOUL.md')" }),
+			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			ensureDirs();
-			const { target, date } = params;
+			const { target, date, filename } = params;
 
 			if (target === "list") {
+				const sections: string[] = [];
 				try {
-					const files = fs.readdirSync(DAILY_DIR).filter((f) => f.endsWith(".md")).sort().reverse();
-					if (files.length === 0) {
-						return { content: [{ type: "text", text: "No daily logs found." }], details: {} };
-					}
-					return {
-						content: [{ type: "text", text: `Daily logs:\n${files.map((f) => `- ${f}`).join("\n")}` }],
-						details: { files },
-					};
-				} catch {
-					return { content: [{ type: "text", text: "No daily logs directory." }], details: {} };
+					const rootFiles = fs.readdirSync(MEMORY_DIR).filter(f => f.endsWith(".md") || f.endsWith(".json")).sort();
+					if (rootFiles.length > 0) sections.push(`Files:\n${rootFiles.map(f => `- ${f}`).join("\n")}`);
+				} catch {}
+				try {
+					const noteFiles = fs.readdirSync(NOTES_DIR).filter(f => f.endsWith(".md")).sort();
+					if (noteFiles.length > 0) sections.push(`Notes:\n${noteFiles.map(f => `- notes/${f}`).join("\n")}`);
+				} catch {}
+				try {
+					const dailyFiles = fs.readdirSync(DAILY_DIR).filter(f => f.endsWith(".md")).sort().reverse();
+					if (dailyFiles.length > 0) sections.push(`Daily logs (${dailyFiles.length}):\n${dailyFiles.slice(0, 10).map(f => `- daily/${f}`).join("\n")}${dailyFiles.length > 10 ? `\n  ... and ${dailyFiles.length - 10} more` : ""}`);
+				} catch {}
+				if (sections.length === 0) {
+					return { content: [{ type: "text", text: "Memory directory is empty." }], details: {} };
 				}
+				return { content: [{ type: "text", text: sections.join("\n\n") }], details: {} };
+			}
+
+			if (target === "file") {
+				if (!filename) {
+					return { content: [{ type: "text", text: "Error: 'filename' is required for target 'file'." }], details: {} };
+				}
+				const safe = path.basename(filename);
+				const filePath = path.join(MEMORY_DIR, safe);
+				const content = readFileSafe(filePath);
+				if (!content) {
+					return { content: [{ type: "text", text: `File not found: ${safe}` }], details: {} };
+				}
+				return { content: [{ type: "text", text: content }], details: { path: filePath, filename: safe } };
+			}
+
+			if (target === "note") {
+				if (!filename) {
+					return { content: [{ type: "text", text: "Error: 'filename' is required for target 'note'." }], details: {} };
+				}
+				const safe = path.basename(filename);
+				const filePath = path.join(NOTES_DIR, safe);
+				const content = readFileSafe(filePath);
+				if (!content) {
+					return { content: [{ type: "text", text: `Note not found: notes/${safe}` }], details: {} };
+				}
+				return { content: [{ type: "text", text: content }], details: { path: filePath, filename: `notes/${safe}` } };
 			}
 
 			if (target === "daily") {
@@ -752,6 +861,80 @@ export default function (pi: ExtensionAPI) {
 			return {
 				content: [{ type: "text", text: content }],
 				details: { path: MEMORY_FILE },
+			};
+		},
+	});
+
+	// memory_search tool
+	pi.registerTool({
+		name: "memory_search",
+		label: "Memory Search",
+		description: [
+			"Search across all memory files (MEMORY.md, SCRATCHPAD.md, daily logs, notes/, and any other .md files).",
+			"Matches filenames and file contents. Case-insensitive keyword search.",
+			"Returns matching files and lines with paths.",
+		].join("\n"),
+		parameters: Type.Object({
+			query: Type.String({ description: "Search query (case-insensitive substring match)" }),
+			max_results: Type.Optional(
+				Type.Number({ description: "Maximum results to return (default: 20)", default: 20 }),
+			),
+		}),
+		async execute(_toolCallId, params) {
+			ensureDirs();
+			const { query, max_results } = params;
+			const limit = max_results ?? 20;
+			const needle = query.toLowerCase();
+
+			const fileMatches: string[] = [];
+			const lineResults: { file: string; line: number; text: string }[] = [];
+
+			function searchFile(filePath: string, displayName: string) {
+				// Check filename match
+				if (displayName.toLowerCase().includes(needle) && !fileMatches.includes(displayName)) {
+					fileMatches.push(displayName);
+				}
+				// Check content
+				const content = readFileSafe(filePath);
+				if (!content) return;
+				const lines = content.split("\n");
+				for (let i = 0; i < lines.length && lineResults.length < limit; i++) {
+					if (lines[i].toLowerCase().includes(needle)) {
+						lineResults.push({ file: displayName, line: i + 1, text: lines[i].trimEnd() });
+					}
+				}
+			}
+
+			function searchDir(dir: string, prefix: string) {
+				try {
+					const files = fs.readdirSync(dir).filter(f => f.endsWith(".md")).sort();
+					for (const f of files) {
+						if (lineResults.length >= limit) break;
+						searchFile(path.join(dir, f), prefix ? `${prefix}/${f}` : f);
+					}
+				} catch {}
+			}
+
+			// Search root, daily/, notes/
+			searchDir(MEMORY_DIR, "");
+			searchDir(DAILY_DIR, "daily");
+			searchDir(NOTES_DIR, "notes");
+
+			if (fileMatches.length === 0 && lineResults.length === 0) {
+				return { content: [{ type: "text", text: `No results for "${query}".` }], details: {} };
+			}
+
+			const parts: string[] = [];
+			if (fileMatches.length > 0) {
+				parts.push(`Files matching "${query}":\n${fileMatches.map(f => `- ${f}`).join("\n")}`);
+			}
+			if (lineResults.length > 0) {
+				parts.push(`Content matches:\n${lineResults.map(r => `${r.file}:${r.line}: ${r.text}`).join("\n")}`);
+			}
+
+			return {
+				content: [{ type: "text", text: parts.join("\n\n") }],
+				details: { query, fileMatches: fileMatches.length, lineMatches: lineResults.length },
 			};
 		},
 	});
