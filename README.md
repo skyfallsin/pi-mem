@@ -65,12 +65,12 @@ An auto-generated "Last 24h" summary is shown on session start and switch:
 
 ## Related
 
-- **[pi-reflect](https://github.com/skyfallsin/pi-reflect)** — Self-improving reflection engine for pi. Analyzes recent conversations and iterates on memory, behavioral rules, and identity files. Pairs naturally with pi-mem.
+- **[pi-reflect](https://github.com/jo-inc/pi-reflect)** — Self-improving reflection engine for pi. Analyzes recent conversations and iterates on memory, behavioral rules, and identity files. Pairs naturally with pi-mem.
 
 ## Installation
 
 ```bash
-pi install git:github.com/skyfallsin/pi-mem
+pi install git:github.com/jo-inc/pi-mem
 ```
 
 ## License

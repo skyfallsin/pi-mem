@@ -30,250 +30,47 @@ import { Type } from "@sinclair/typebox";
 import { StringEnum, completeSimple, getModel } from "@mariozechner/pi-ai";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { createReadStream } from "node:fs";
-import { createInterface } from "node:readline";
-
-const MEMORY_DIR = process.env.PI_MEMORY_DIR ?? path.join(process.env.HOME ?? "~", ".pi", "agent", "memory");
-const MEMORY_FILE = path.join(MEMORY_DIR, "MEMORY.md");
-const SCRATCHPAD_FILE = path.join(MEMORY_DIR, "SCRATCHPAD.md");
-const DAILY_DIR = process.env.PI_DAILY_DIR ?? path.join(MEMORY_DIR, "daily");
-const NOTES_DIR = path.join(MEMORY_DIR, "notes");
-
-// Extra files to inject into context alongside MEMORY.md/SCRATCHPAD.md/daily.
-// Comma-separated list of filenames resolved relative to MEMORY_DIR.
-// These should be small, always-needed identity/behavioral files.
-// Example: PI_CONTEXT_FILES=SOUL.md,AGENTS.md,HEARTBEAT.md
-const CONTEXT_FILES = (process.env.PI_CONTEXT_FILES ?? "")
-	.split(",")
-	.map(f => f.trim())
-	.filter(Boolean);
-
-// Auto-commit changes to git after every write. Off by default.
-const AUTOCOMMIT = process.env.PI_AUTOCOMMIT === "1" || process.env.PI_AUTOCOMMIT === "true";
-
 import { execFileSync } from "node:child_process";
 
+import {
+	type MemoryConfig,
+	type ScratchpadItem,
+	type SessionInfo,
+	buildConfig,
+	todayStr,
+	yesterdayStr,
+	nowTimestamp,
+	shortSessionId,
+	readFileSafe,
+	dailyPath,
+	ensureDirs,
+	parseScratchpad,
+	serializeScratchpad,
+	buildMemoryContext,
+	scanSession,
+	isHousekeeping,
+	searchMemory,
+} from "./lib.ts";
+
+const config = buildConfig();
+
 function gitCommit(message: string) {
-	if (!AUTOCOMMIT) return;
+	if (!config.autocommit) return;
 	try {
-		execFileSync("git", ["add", "-A"], { cwd: MEMORY_DIR, stdio: "ignore", timeout: 5000 });
-		execFileSync("git", ["commit", "-m", message, "--allow-empty-message", "--no-verify"], { cwd: MEMORY_DIR, stdio: "ignore", timeout: 5000 });
+		execFileSync("git", ["add", "-A"], { cwd: config.memoryDir, stdio: "ignore", timeout: 5000 });
+		execFileSync("git", ["commit", "-m", message, "--allow-empty-message", "--no-verify"], { cwd: config.memoryDir, stdio: "ignore", timeout: 5000 });
 	} catch {
 		// git not available or not a repo — silently skip
 	}
 }
 
-function ensureDirs() {
-	fs.mkdirSync(MEMORY_DIR, { recursive: true });
-	fs.mkdirSync(DAILY_DIR, { recursive: true });
-	fs.mkdirSync(NOTES_DIR, { recursive: true });
-}
-
-function todayStr(): string {
-	const d = new Date();
-	return d.toISOString().slice(0, 10);
-}
-
-function yesterdayStr(): string {
-	const d = new Date();
-	d.setDate(d.getDate() - 1);
-	return d.toISOString().slice(0, 10);
-}
-
-function nowTimestamp(): string {
-	return new Date().toISOString().replace("T", " ").replace(/\.\d+Z$/, "");
-}
-
-function shortSessionId(sessionId: string): string {
-	return sessionId.slice(0, 8);
-}
-
-function readFileSafe(filePath: string): string | null {
-	try {
-		return fs.readFileSync(filePath, "utf-8");
-	} catch {
-		return null;
-	}
-}
-
-function dailyPath(date: string): string {
-	return path.join(DAILY_DIR, `${date}.md`);
-}
-
-// --- Scratchpad helpers ---
-
-interface ScratchpadItem {
-	done: boolean;
-	text: string;
-	meta: string; // the <!-- timestamp [session] --> comment
-}
-
-function parseScratchpad(content: string): ScratchpadItem[] {
-	const items: ScratchpadItem[] = [];
-	const lines = content.split("\n");
-	for (let i = 0; i < lines.length; i++) {
-		const line = lines[i];
-		const match = line.match(/^- \[([ xX])\] (.+)$/);
-		if (match) {
-			// Look for a meta comment on the preceding line
-			let meta = "";
-			if (i > 0 && lines[i - 1].match(/^<!--.*-->$/)) {
-				meta = lines[i - 1];
-			}
-			items.push({
-				done: match[1].toLowerCase() === "x",
-				text: match[2],
-				meta,
-			});
-		}
-	}
-	return items;
-}
-
-function serializeScratchpad(items: ScratchpadItem[]): string {
-	const lines: string[] = ["# Scratchpad", ""];
-	for (const item of items) {
-		if (item.meta) {
-			lines.push(item.meta);
-		}
-		const checkbox = item.done ? "[x]" : "[ ]";
-		lines.push(`- ${checkbox} ${item.text}`);
-	}
-	return lines.join("\n") + "\n";
-}
-
-function buildMemoryContext(): string {
-	ensureDirs();
-	const sections: string[] = [];
-
-	// Configurable context files (SOUL.md, AGENTS.md, HEARTBEAT.md, etc.)
-	for (const fileName of CONTEXT_FILES) {
-		const filePath = path.join(MEMORY_DIR, fileName);
-		const content = readFileSafe(filePath);
-		if (content?.trim()) {
-			sections.push(`## ${fileName}\n\n${content.trim()}`);
-		}
-	}
-
-	const longTerm = readFileSafe(MEMORY_FILE);
-	if (longTerm?.trim()) {
-		sections.push(`## MEMORY.md (long-term)\n\n${longTerm.trim()}`);
-	}
-
-	const scratchpad = readFileSafe(SCRATCHPAD_FILE);
-	if (scratchpad?.trim()) {
-		const openItems = parseScratchpad(scratchpad).filter((i) => !i.done);
-		if (openItems.length > 0) {
-			sections.push(`## SCRATCHPAD.md (working context)\n\n${serializeScratchpad(openItems)}`);
-		}
-	}
-
-	const today = todayStr();
-	const yesterday = yesterdayStr();
-
-	const todayContent = readFileSafe(dailyPath(today));
-	if (todayContent?.trim()) {
-		sections.push(`## Daily log: ${today} (today)\n\n${todayContent.trim()}`);
-	}
-
-	const yesterdayContent = readFileSafe(dailyPath(yesterday));
-	if (yesterdayContent?.trim()) {
-		sections.push(`## Daily log: ${yesterday} (yesterday)\n\n${yesterdayContent.trim()}`);
-	}
-
-	if (sections.length === 0) {
-		return "";
-	}
-
-	return `# Memory\n\n${sections.join("\n\n---\n\n")}`;
-}
-
 // --- Session scanner for "Last 24h" dashboard ---
 
 const SESSIONS_DIR = path.join(process.env.HOME ?? "~", ".pi", "agent", "sessions");
-const SUMMARY_CACHE = path.join(DAILY_DIR, "cache.json");
-const REBUILD_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
-const LOOKBACK_MS = 24 * 60 * 60 * 1000; // 24 hours
+const SUMMARY_CACHE = path.join(config.dailyDir, "cache.json");
+const REBUILD_INTERVAL_MS = 15 * 60 * 1000;
+const LOOKBACK_MS = 24 * 60 * 60 * 1000;
 
-interface SessionInfo {
-	file: string;
-	timestamp: string;
-	title: string;
-	isChild: boolean;
-	parentSession?: string;
-	cwd: string;
-	cost: number;
-}
-
-/** Read first line + scan for session_info and cost from a jsonl file */
-async function scanSession(filePath: string): Promise<SessionInfo | null> {
-	try {
-		const cutoffTime = Date.now() - LOOKBACK_MS;
-		const rl = createInterface({ input: createReadStream(filePath), crlfDelay: Infinity });
-		let lineNum = 0;
-		let header: any = null;
-		let title = "";
-		let totalCost = 0;
-
-		for await (const line of rl) {
-			lineNum++;
-			if (lineNum === 1) {
-				try {
-					header = JSON.parse(line);
-				} catch { return null; }
-				// Skip sessions whose timestamp is older than the lookback window
-				if (header.timestamp && new Date(header.timestamp).getTime() < cutoffTime) {
-					rl.close();
-					return null;
-				}
-				continue;
-			}
-			try {
-				const entry = JSON.parse(line);
-				if (entry.type === "session_info" && entry.name) {
-					title = entry.name;
-				}
-				if (entry.type === "message" && entry.message?.role === "assistant" && entry.message?.usage?.cost?.total) {
-					totalCost += entry.message.usage.cost.total;
-				}
-			} catch { continue; }
-		}
-
-		if (!header?.timestamp) return null;
-
-		// Fall back to first user message text if no title
-		if (!title) {
-			const rl2 = createInterface({ input: createReadStream(filePath), crlfDelay: Infinity });
-			for await (const line of rl2) {
-				try {
-					const entry = JSON.parse(line);
-					if (entry.type === "message" && entry.message?.role === "user") {
-						const content = entry.message.content;
-						if (typeof content === "string") {
-							title = content.slice(0, 80);
-						} else if (Array.isArray(content)) {
-							const textPart = content.find((c: any) => c.type === "text");
-							if (textPart) title = textPart.text.slice(0, 80);
-						}
-						break;
-					}
-				} catch { continue; }
-			}
-		}
-
-		return {
-			file: filePath,
-			timestamp: header.timestamp,
-			title: title || "(untitled)",
-			isChild: !!header.parentSession,
-			parentSession: header.parentSession || undefined,
-			cwd: header.cwd || "",
-			cost: totalCost,
-		};
-	} catch { return null; }
-}
-
-// Store model registry ref so buildSessionSummary can call LLM
 let modelRegistryRef: any = null;
 
 async function collectSessions(): Promise<{ roots: SessionInfo[]; childCountMap: Map<string, number>; totalCost: number }> {
@@ -320,20 +117,6 @@ async function collectSessions(): Promise<{ roots: SessionInfo[]; childCountMap:
 	return { roots, childCountMap, totalCost };
 }
 
-function isHousekeeping(title: string): boolean {
-	const lower = title.toLowerCase();
-	const patterns = [
-		/^(clear|review|read)\s+(done|scratchpad|today|daily)/,
-		/^-\s+(no done|scratchpad|cleared|reviewed|task is)/,
-		/^scratchpad\s+(content|management|maintenance|reviewed|items)/,
-		/^\(untitled\)$/,
-		/^\/\w+$/, // bare slash commands like /reload
-		/^write daily log/,
-	];
-	return patterns.some(p => p.test(lower));
-}
-
-/** Ask LLM to produce a concise grouped narrative summary */
 async function summarizeWithLLM(sessions: SessionInfo[], childCountMap: Map<string, number>, totalCost: number): Promise<string> {
 	if (!modelRegistryRef) return "";
 
@@ -352,8 +135,7 @@ async function summarizeWithLLM(sessions: SessionInfo[], childCountMap: Map<stri
 	}
 	if (!model || !apiKey) return "";
 
-	// Build rich listing with metadata
-	const listing = sessions.map((s, i) => {
+	const listing = sessions.map((s, _i) => {
 		const childCount = childCountMap.get(s.file) || 0;
 		const parts = [`${s.title}`];
 		if (childCount > 0) parts.push(`[${childCount} sub-agents]`);
@@ -396,7 +178,6 @@ async function buildSessionSummary(): Promise<string> {
 	const { roots, childCountMap, totalCost } = await collectSessions();
 	if (roots.length === 0) return "";
 
-	// Sort oldest first, filter housekeeping
 	const sorted = [...roots]
 		.filter(s => !isHousekeeping(s.title))
 		.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
@@ -410,7 +191,6 @@ async function buildSessionSummary(): Promise<string> {
 		if (summary) return `${header}\n\n${summary}`;
 	} catch {}
 
-	// Fallback: flat list
 	const lines = [header, ""];
 	for (const s of sorted) {
 		const childCount = childCountMap.get(s.file) || 0;
@@ -420,7 +200,6 @@ async function buildSessionSummary(): Promise<string> {
 	return lines.join("\n");
 }
 
-// Cached summary + rebuild timer
 let cachedSummary = "";
 let lastRebuildTime = 0;
 
@@ -430,7 +209,6 @@ async function getOrRebuildSummary(): Promise<string> {
 		return cachedSummary;
 	}
 
-	// Try loading from disk cache first
 	if (!cachedSummary) {
 		try {
 			const cache = JSON.parse(fs.readFileSync(SUMMARY_CACHE, "utf-8"));
@@ -445,9 +223,8 @@ async function getOrRebuildSummary(): Promise<string> {
 	cachedSummary = await buildSessionSummary();
 	lastRebuildTime = now;
 
-	// Persist to disk so other pi instances see it
 	try {
-		ensureDirs();
+		ensureDirs(config);
 		fs.writeFileSync(SUMMARY_CACHE, JSON.stringify({ summary: cachedSummary, timestamp: now }), "utf-8");
 	} catch {}
 
@@ -461,7 +238,7 @@ export default function (pi: ExtensionAPI) {
 		if (!ctx.hasUI) return;
 
 		const summary = await getOrRebuildSummary();
-		const scratchContent = readFileSafe(SCRATCHPAD_FILE);
+		const scratchContent = readFileSafe(config.scratchpadFile);
 
 		const sections: string[] = [];
 
@@ -496,13 +273,12 @@ export default function (pi: ExtensionAPI) {
 		modelRegistryRef = ctx.modelRegistry;
 		await showDashboard(ctx);
 
-		// Start background rebuild timer
 		if (!rebuildTimer) {
 			rebuildTimer = setInterval(async () => {
 				cachedSummary = await buildSessionSummary();
 				lastRebuildTime = Date.now();
 				try {
-					ensureDirs();
+					ensureDirs(config);
 					fs.writeFileSync(SUMMARY_CACHE, JSON.stringify({ summary: cachedSummary, timestamp: lastRebuildTime }), "utf-8");
 				} catch {}
 			}, REBUILD_INTERVAL_MS);
@@ -514,7 +290,6 @@ export default function (pi: ExtensionAPI) {
 		await showDashboard(ctx);
 	});
 
-	// Clear widget once agent starts working
 	pi.on("agent_start", async (_event, ctx) => {
 		ctx.ui.setWidget("memory-dashboard", undefined);
 	});
@@ -523,9 +298,8 @@ export default function (pi: ExtensionAPI) {
 		if (rebuildTimer) { clearInterval(rebuildTimer); rebuildTimer = null; }
 	});
 
-	// Inject memory context before every agent turn
 	pi.on("before_agent_start", async (event, _ctx) => {
-		const memoryContext = buildMemoryContext();
+		const memoryContext = buildMemoryContext(config);
 		if (!memoryContext) return;
 
 		const memoryInstructions = [
@@ -544,9 +318,8 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
-	// Pre-compaction memory flush
 	pi.on("session_before_compact", async (_event, ctx) => {
-		const memoryContext = buildMemoryContext();
+		const memoryContext = buildMemoryContext(config);
 		const hasMemory = memoryContext.length > 0;
 
 		if (hasMemory) {
@@ -580,8 +353,8 @@ export default function (pi: ExtensionAPI) {
 			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			ensureDirs();
-			const { target, content, mode } = params;
+			ensureDirs(config);
+			const { target, content, mode, filename } = params;
 			const sid = shortSessionId(ctx.sessionManager.getSessionId());
 			const ts = nowTimestamp();
 
@@ -590,7 +363,7 @@ export default function (pi: ExtensionAPI) {
 					return { content: [{ type: "text", text: "Error: 'filename' is required for target 'note'." }], details: {} };
 				}
 				const safe = path.basename(filename);
-				const filePath = path.join(NOTES_DIR, safe);
+				const filePath = path.join(config.notesDir, safe);
 				const existing = readFileSafe(filePath) ?? "";
 
 				if (mode === "overwrite") {
@@ -614,7 +387,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (target === "daily") {
-				const filePath = dailyPath(todayStr());
+				const filePath = dailyPath(config.dailyDir, todayStr());
 				const existing = readFileSafe(filePath) ?? "";
 
 				const existingSnippet = existing.trim()
@@ -632,29 +405,28 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// long_term
-			const existing = readFileSafe(MEMORY_FILE) ?? "";
+			const existing = readFileSafe(config.memoryFile) ?? "";
 			const existingSnippet = existing.trim()
 				? `\n\nExisting MEMORY.md content:\n${existing.trim()}`
 				: "\n\nMEMORY.md was empty.";
 
 			if (mode === "overwrite") {
 				const stamped = `<!-- last updated: ${ts} [${sid}] -->\n${content}`;
-				fs.writeFileSync(MEMORY_FILE, stamped, "utf-8");
+				fs.writeFileSync(config.memoryFile, stamped, "utf-8");
 				gitCommit("memory: overwrite");
 				return {
 					content: [{ type: "text", text: `Overwrote MEMORY.md${existingSnippet}` }],
-					details: { path: MEMORY_FILE, target, mode: "overwrite", sessionId: sid, timestamp: ts },
+					details: { path: config.memoryFile, target, mode: "overwrite", sessionId: sid, timestamp: ts },
 				};
 			}
 
-			// append (default)
 			const separator = existing.trim() ? "\n\n" : "";
 			const stamped = `<!-- ${ts} [${sid}] -->\n${content}`;
-			fs.writeFileSync(MEMORY_FILE, existing + separator + stamped, "utf-8");
+			fs.writeFileSync(config.memoryFile, existing + separator + stamped, "utf-8");
 			gitCommit("memory: append");
 			return {
 				content: [{ type: "text", text: `Appended to MEMORY.md${existingSnippet}` }],
-				details: { path: MEMORY_FILE, target, mode: "append", sessionId: sid, timestamp: ts },
+				details: { path: config.memoryFile, target, mode: "append", sessionId: sid, timestamp: ts },
 			};
 		},
 	});
@@ -680,12 +452,12 @@ export default function (pi: ExtensionAPI) {
 			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			ensureDirs();
+			ensureDirs(config);
 			const { action, text } = params;
 			const sid = shortSessionId(ctx.sessionManager.getSessionId());
 			const ts = nowTimestamp();
 
-			const existing = readFileSafe(SCRATCHPAD_FILE) ?? "";
+			const existing = readFileSafe(config.scratchpadFile) ?? "";
 			let items = parseScratchpad(existing);
 
 			if (action === "list") {
@@ -703,7 +475,7 @@ export default function (pi: ExtensionAPI) {
 					return { content: [{ type: "text", text: "Error: 'text' is required for add." }], details: {} };
 				}
 				items.push({ done: false, text, meta: `<!-- ${ts} [${sid}] -->` });
-				fs.writeFileSync(SCRATCHPAD_FILE, serializeScratchpad(items), "utf-8");
+				fs.writeFileSync(config.scratchpadFile, serializeScratchpad(items), "utf-8");
 				gitCommit(`scratchpad: add`);
 				return {
 					content: [{ type: "text", text: `Added: - [ ] ${text}\n\n${serializeScratchpad(items)}` }],
@@ -731,7 +503,7 @@ export default function (pi: ExtensionAPI) {
 						details: {},
 					};
 				}
-				fs.writeFileSync(SCRATCHPAD_FILE, serializeScratchpad(items), "utf-8");
+				fs.writeFileSync(config.scratchpadFile, serializeScratchpad(items), "utf-8");
 				gitCommit(`scratchpad: ${action}`);
 				return {
 					content: [{ type: "text", text: `Updated.\n\n${serializeScratchpad(items)}` }],
@@ -743,7 +515,7 @@ export default function (pi: ExtensionAPI) {
 				const before = items.length;
 				items = items.filter((i) => !i.done);
 				const removed = before - items.length;
-				fs.writeFileSync(SCRATCHPAD_FILE, serializeScratchpad(items), "utf-8");
+				fs.writeFileSync(config.scratchpadFile, serializeScratchpad(items), "utf-8");
 				gitCommit("scratchpad: clear_done");
 				return {
 					content: [{ type: "text", text: `Cleared ${removed} done item(s).\n\n${serializeScratchpad(items)}` }],
@@ -780,21 +552,21 @@ export default function (pi: ExtensionAPI) {
 			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			ensureDirs();
+			ensureDirs(config);
 			const { target, date, filename } = params;
 
 			if (target === "list") {
 				const sections: string[] = [];
 				try {
-					const rootFiles = fs.readdirSync(MEMORY_DIR).filter(f => f.endsWith(".md") || f.endsWith(".json")).sort();
+					const rootFiles = fs.readdirSync(config.memoryDir).filter(f => f.endsWith(".md") || f.endsWith(".json")).sort();
 					if (rootFiles.length > 0) sections.push(`Files:\n${rootFiles.map(f => `- ${f}`).join("\n")}`);
 				} catch {}
 				try {
-					const noteFiles = fs.readdirSync(NOTES_DIR).filter(f => f.endsWith(".md")).sort();
+					const noteFiles = fs.readdirSync(config.notesDir).filter(f => f.endsWith(".md")).sort();
 					if (noteFiles.length > 0) sections.push(`Notes:\n${noteFiles.map(f => `- notes/${f}`).join("\n")}`);
 				} catch {}
 				try {
-					const dailyFiles = fs.readdirSync(DAILY_DIR).filter(f => f.endsWith(".md")).sort().reverse();
+					const dailyFiles = fs.readdirSync(config.dailyDir).filter(f => f.endsWith(".md")).sort().reverse();
 					if (dailyFiles.length > 0) sections.push(`Daily logs (${dailyFiles.length}):\n${dailyFiles.slice(0, 10).map(f => `- daily/${f}`).join("\n")}${dailyFiles.length > 10 ? `\n  ... and ${dailyFiles.length - 10} more` : ""}`);
 				} catch {}
 				if (sections.length === 0) {
@@ -808,7 +580,7 @@ export default function (pi: ExtensionAPI) {
 					return { content: [{ type: "text", text: "Error: 'filename' is required for target 'file'." }], details: {} };
 				}
 				const safe = path.basename(filename);
-				const filePath = path.join(MEMORY_DIR, safe);
+				const filePath = path.join(config.memoryDir, safe);
 				const content = readFileSafe(filePath);
 				if (!content) {
 					return { content: [{ type: "text", text: `File not found: ${safe}` }], details: {} };
@@ -821,7 +593,7 @@ export default function (pi: ExtensionAPI) {
 					return { content: [{ type: "text", text: "Error: 'filename' is required for target 'note'." }], details: {} };
 				}
 				const safe = path.basename(filename);
-				const filePath = path.join(NOTES_DIR, safe);
+				const filePath = path.join(config.notesDir, safe);
 				const content = readFileSafe(filePath);
 				if (!content) {
 					return { content: [{ type: "text", text: `Note not found: notes/${safe}` }], details: {} };
@@ -831,7 +603,7 @@ export default function (pi: ExtensionAPI) {
 
 			if (target === "daily") {
 				const d = date ?? todayStr();
-				const filePath = dailyPath(d);
+				const filePath = dailyPath(config.dailyDir, d);
 				const content = readFileSafe(filePath);
 				if (!content) {
 					return { content: [{ type: "text", text: `No daily log for ${d}.` }], details: {} };
@@ -843,24 +615,24 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (target === "scratchpad") {
-				const content = readFileSafe(SCRATCHPAD_FILE);
+				const content = readFileSafe(config.scratchpadFile);
 				if (!content?.trim()) {
 					return { content: [{ type: "text", text: "SCRATCHPAD.md is empty or does not exist." }], details: {} };
 				}
 				return {
 					content: [{ type: "text", text: content }],
-					details: { path: SCRATCHPAD_FILE },
+					details: { path: config.scratchpadFile },
 				};
 			}
 
 			// long_term
-			const content = readFileSafe(MEMORY_FILE);
+			const content = readFileSafe(config.memoryFile);
 			if (!content) {
 				return { content: [{ type: "text", text: "MEMORY.md is empty or does not exist." }], details: {} };
 			}
 			return {
 				content: [{ type: "text", text: content }],
-				details: { path: MEMORY_FILE },
+				details: { path: config.memoryFile },
 			};
 		},
 	});
@@ -881,60 +653,27 @@ export default function (pi: ExtensionAPI) {
 			),
 		}),
 		async execute(_toolCallId, params) {
-			ensureDirs();
+			ensureDirs(config);
 			const { query, max_results } = params;
 			const limit = max_results ?? 20;
-			const needle = query.toLowerCase();
 
-			const fileMatches: string[] = [];
-			const lineResults: { file: string; line: number; text: string }[] = [];
+			const result = searchMemory(config, query, limit);
 
-			function searchFile(filePath: string, displayName: string) {
-				// Check filename match
-				if (displayName.toLowerCase().includes(needle) && !fileMatches.includes(displayName)) {
-					fileMatches.push(displayName);
-				}
-				// Check content
-				const content = readFileSafe(filePath);
-				if (!content) return;
-				const lines = content.split("\n");
-				for (let i = 0; i < lines.length && lineResults.length < limit; i++) {
-					if (lines[i].toLowerCase().includes(needle)) {
-						lineResults.push({ file: displayName, line: i + 1, text: lines[i].trimEnd() });
-					}
-				}
-			}
-
-			function searchDir(dir: string, prefix: string) {
-				try {
-					const files = fs.readdirSync(dir).filter(f => f.endsWith(".md")).sort();
-					for (const f of files) {
-						if (lineResults.length >= limit) break;
-						searchFile(path.join(dir, f), prefix ? `${prefix}/${f}` : f);
-					}
-				} catch {}
-			}
-
-			// Search root, daily/, notes/
-			searchDir(MEMORY_DIR, "");
-			searchDir(DAILY_DIR, "daily");
-			searchDir(NOTES_DIR, "notes");
-
-			if (fileMatches.length === 0 && lineResults.length === 0) {
+			if (result.fileMatches.length === 0 && result.lineResults.length === 0) {
 				return { content: [{ type: "text", text: `No results for "${query}".` }], details: {} };
 			}
 
 			const parts: string[] = [];
-			if (fileMatches.length > 0) {
-				parts.push(`Files matching "${query}":\n${fileMatches.map(f => `- ${f}`).join("\n")}`);
+			if (result.fileMatches.length > 0) {
+				parts.push(`Files matching "${query}":\n${result.fileMatches.map(f => `- ${f}`).join("\n")}`);
 			}
-			if (lineResults.length > 0) {
-				parts.push(`Content matches:\n${lineResults.map(r => `${r.file}:${r.line}: ${r.text}`).join("\n")}`);
+			if (result.lineResults.length > 0) {
+				parts.push(`Content matches:\n${result.lineResults.map(r => `${r.file}:${r.line}: ${r.text}`).join("\n")}`);
 			}
 
 			return {
 				content: [{ type: "text", text: parts.join("\n\n") }],
-				details: { query, fileMatches: fileMatches.length, lineMatches: lineResults.length },
+				details: { query, fileMatches: result.fileMatches.length, lineMatches: result.lineResults.length },
 			};
 		},
 	});

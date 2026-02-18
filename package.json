@@ -1,10 +1,12 @@
 {
-  "name": "@skyfallsin/pi-mem",
+  "name": "@jo-inc/pi-mem",
   "version": "1.0.0",
   "description": "Pi coding agent extension for plain-Markdown memory system — long-term memory, daily logs, and scratchpad checklist",
   "main": "index.ts",
   "type": "module",
   "keywords": [
+    "pi-package",
+    "pi-extension",
     "pi",
     "pi-coding-agent",
     "memory",
@@ -12,20 +14,30 @@
     "scratchpad",
     "daily-log"
   ],
-  "author": "skyfallsin",
+  "scripts": {
+    "test": "node --import tsx --test tests/*.test.ts"
+  },
+  "author": "jo-inc",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/skyfallsin/pi-mem.git"
+    "url": "https://github.com/jo-inc/pi-mem.git"
   },
   "bugs": {
-    "url": "https://github.com/skyfallsin/pi-mem/issues"
+    "url": "https://github.com/jo-inc/pi-mem/issues"
   },
-  "homepage": "https://github.com/skyfallsin/pi-mem#readme",
+  "homepage": "https://github.com/jo-inc/pi-mem#readme",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": ">=0.0.1",
-    "@mariozechner/pi-ai": ">=0.0.1",
-    "@mariozechner/pi-tui": ">=0.0.1",
-    "@sinclair/typebox": ">=0.34.0"
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "@types/node": "^22.0.0"
   }
 }
