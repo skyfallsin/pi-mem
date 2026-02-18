@@ -28,7 +28,11 @@
   },
   "homepage": "https://github.com/jo-inc/pi-mem#readme",
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": ["./index.ts"],
+    "image": "https://raw.githubusercontent.com/jo-inc/pi-mem/main/logo.png"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
